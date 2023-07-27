@@ -1,0 +1,157 @@
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error
+from keras.models import Sequential
+from keras.layers import LSTM, RepeatVector, TimeDistributed
+from keras.layers import Dense
+from keras.layers import Flatten
+from keras.layers.convolutional import Conv1D
+from keras.layers.convolutional import MaxPooling1D
+
+from numpy import array
+from numpy import hstack
+import pandas as pd
+
+# load dataset
+df = pd.read_csv('All_Indecies_BC4_New.csv')
+df['Date'] = pd.to_datetime(df['Date'])
+df = df.set_index('Date')
+
+# Choose lag value
+lag_value = 4
+
+# scale features
+scaler = MinMaxScaler(feature_range=(0, 1))
+scaled = scaler.fit_transform(df.values)
+
+# frame as supervised learning
+def series_to_supervised(data, n_in=1, n_out=1, dropnan=True):
+    n_vars = 1 if type(data) is list else data.shape[1]
+    df = pd.DataFrame(data)
+    cols, names = list(), list()
+    # input sequence (t-n, ... t-1)
+    for i in range(n_in, 0, -1):
+        cols.append(df.shift(i))
+        names += [('var%d(t-%d)' % (j+1, i)) for j in range(n_vars)]
+    # forecast sequence (t, t+1, ... t+n)
+    for i in range(0, n_out):
+        cols.append(df.shift(-i))
+        if i == 0:
+            names += [('var%d(t)' % (j+1)) for j in range(n_vars)]
+        else:
+            names += [('var%d(t+%d)' % (j+1, i)) for j in range(n_vars)]
+    # put it all together
+    agg = pd.concat(cols, axis=1)
+    agg.columns = names
+    # drop rows with NaN values
+    if dropnan:
+        agg.dropna(inplace=True)
+    return agg
+
+#Grid search 
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.optim import Adam
+from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_absolute_error
+
+# Assume df is your DataFrame and lag_value is the number of time lags you want to use
+n_features = df.shape[1]
+
+# Convert your DataFrame into the right format for supervised learning
+reframed = series_to_supervised(scaled, lag_value, 1)
+
+# Split into input and outputs
+n_obs = lag_value * n_features
+
+values = reframed.values
+n_train_time = 268 # adjust if necessary
+train = values[:n_train_time, :]
+test = values[n_train_time:, :]
+
+train_X, train_y = train[:, :n_obs], train[:, -n_features:]
+test_X, test_y = test[:, :n_obs], test[:, -n_features:]
+
+# Reshape input to be 3D [samples, timesteps, features]
+train_X = train_X.reshape((train_X.shape[0], lag_value, n_features))
+test_X = test_X.reshape((test_X.shape[0], lag_value, n_features))
+
+# Convert to PyTorch tensors
+train_X_torch = torch.from_numpy(train_X).float()
+train_y_torch = torch.from_numpy(train_y).float()
+
+test_X_torch = torch.from_numpy(test_X).float()
+test_y_torch = torch.from_numpy(test_y).float()
+
+# LSTM-Autoencoder model
+class AutoEncoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(AutoEncoder, self).__init__()
+        self.encoder = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+        self.decoder = nn.LSTM(hidden_dim, output_dim, batch_first=True)
+
+    def forward(self, x):
+        encoded, _ = self.encoder(x)
+        decoded, _ = self.decoder(encoded)
+        return decoded
+
+class LSTM_AE(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(LSTM_AE, self).__init__()
+        self.hidden_dim = hidden_dim
+
+        # Autoencoder
+        self.autoencoder = AutoEncoder(input_dim, hidden_dim, input_dim)
+
+        # LSTM layer
+        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        autoencoded_x = self.autoencoder(x)
+        lstm_out, _ = self.lstm(autoencoded_x)
+        out = self.fc(lstm_out[:, -1, :])
+        return out
+
+# Grid search parameters
+hidden_dims = [100, 500]
+learning_rates = [0.001, 0.01]
+weight_decays = [0, 0.01, 0.1]
+
+best_rmse = np.inf
+best_params = None
+
+for hidden_dim in hidden_dims:
+    for lr in learning_rates:
+        for wd in weight_decays:
+            model = LSTM_AE(n_features, hidden_dim, train_y_torch.shape[1])
+            optimizer = Adam(model.parameters(), lr=lr, weight_decay=wd)
+
+            # Training
+            epochs = 150
+            for epoch in range(epochs):
+                model.zero_grad()
+                output = model(train_X_torch)
+                loss = loss_function(output, train_y_torch)
+                loss.backward()
+                optimizer.step()
+
+            # Testing
+            model.eval()
+            with torch.no_grad():
+                yhat = model(test_X_torch)
+
+            # RMSE calculation
+            yhat = yhat.numpy()
+            test_y = test_y_torch.numpy()
+            rmse = np.sqrt(mean_squared_error(test_y, yhat))
+            mse = mean_squared_error(test_y, yhat)
+            mae = mean_absolute_error(test_y, yhat)
+            print('Hidden Dim: {} LR: {} WD: {} Test RMSE: {} Test MSE: {} Test MAE: {}'.format(hidden_dim, lr, wd, rmse, mse, mae))
+
+            if rmse < best_rmse:
+                best_rmse = rmse
+                best_params = (hidden_dim, lr, wd, mse, mae, rmse)
+
+print("Best params: Hidden Dim - {}, Learning rate - {}, Weight Decay - {}, MSE - {}, MAE - {}".format(*best_params))
